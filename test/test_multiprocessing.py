@@ -83,6 +83,10 @@ def simple_pool_fill(tensor):
     return tensor.add(1)
 
 
+def raise_keyboard_interrupt(i):
+    raise KeyboardInterrupt
+
+
 def send_tensor(queue, event, device, dtype):
     t = torch.ones(5, 5, device=device, dtype=dtype)
     queue.put(t)
@@ -316,6 +320,12 @@ class TestMultiprocessing(TestCase):
         # This will keep tests isolated from each-other
         if torch.cuda.is_available():
             torch.cuda.ipc_collect()
+
+    def test_spawn_child_keyboard_interrupt(self):
+        # A child interrupted while the parent lives must be reported as a
+        # failure, not exit 0 and be mistaken for success.
+        with self.assertRaisesRegex(mp.ProcessRaisedException, "KeyboardInterrupt"):
+            mp.spawn(raise_keyboard_interrupt, nprocs=1, join=True)
 
     def _test_sharing(self, ctx=mp, device="cpu", dtype=torch.float, repeat=1):
         def test_fill():

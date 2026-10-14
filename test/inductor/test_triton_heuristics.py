@@ -113,6 +113,28 @@ def get_autotuned_hcu_sqr_kernel():
 class TestTritonHeuristics(TestCase):
     device_type = GPU_TYPE
 
+    @parametrize("backend", ["cuda", "hip"])
+    @parametrize("disable_ftz", [None, False, True])
+    def test_disable_ftz_compile_options(self, backend, disable_ftz):
+        autotuner = object.__new__(CachingAutotuner)
+        autotuner.device_props = MagicMock(type=backend)
+        compile_meta = {"num_warps": 4, "num_stages": 1, "debug": False}
+        if disable_ftz is not None:
+            compile_meta["disable_ftz"] = disable_ftz
+
+        options = autotuner._create_compile_options(triton.Config({}), compile_meta)
+        ftz_option = (
+            "allow_flush_denorm" if backend == "hip" else "enable_reflect_ftz"
+        )
+        other_option = (
+            "enable_reflect_ftz" if backend == "hip" else "allow_flush_denorm"
+        )
+        self.assertNotIn(other_option, options)
+        if disable_ftz:
+            self.assertIs(options[ftz_option], False)
+        else:
+            self.assertNotIn(ftz_option, options)
+
     def test_triton_config(self):
         """
         Make sure block size does not exceed the maximum defined in inductor config.

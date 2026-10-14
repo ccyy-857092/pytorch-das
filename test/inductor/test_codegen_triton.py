@@ -17,6 +17,10 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_device_type import (
+    dtypes,
+    instantiate_device_type_tests,
+)
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
     HAS_CPU,
@@ -256,6 +260,34 @@ class TestCodegenTriton(InductorTestCase):
             arg = TensorArg(name="x", buffer="buf0", dtype=dtype)
             sig = triton_utils.signature_of(arg, size_dtype=None)
             self.assertEqual(sig, expected_sig, f"wrong signature for {dtype}")
+
+
+@unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+class TestStrictMathCodegen(InductorTestCase):
+    @unittest.skipUnless(torch.version.hip is not None, "requires HIP")
+    @dtypes(torch.float32)
+    def test_rsqrt_subnormal_disable_ftz(self, device, dtype):
+        from triton.compiler.compiler import make_backend
+        from triton.runtime import driver
+
+        backend = make_backend(driver.active.get_current_target())
+        options = backend.parse_options({"allow_flush_denorm": False})
+        if not getattr(options, "allow_flush_denorm_explicitly_set", False):
+            self.skipTest("requires Triton explicit HIP FTZ control")
+
+        bits = torch.tensor(
+            [1, 2, 0x007FFFFF, 0x00800000, 0x3F800000], dtype=torch.int32
+        )
+        x = bits.view(dtype).to(device)
+        expected = torch.rsqrt(x.cpu().double()).to(dtype).to(device)
+        with inductor_config.patch({"eager_numerics.disable_ftz": True}):
+            actual = torch.compile(torch.rsqrt)(x)
+
+        self.assertTrue(torch.isfinite(actual).all())
+        self.assertEqual(actual, expected, rtol=torch.finfo(dtype).eps, atol=0)
+
+
+instantiate_device_type_tests(TestStrictMathCodegen, globals(), only_for=("cuda",))
 
 
 if __name__ == "__main__":

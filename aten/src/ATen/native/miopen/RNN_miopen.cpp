@@ -59,8 +59,6 @@ namespace at::native {
 
 #include <c10/hip/HIPCachingAllocator.h>
 
-#include <rocrand/rocrand_xorwow.h>
-
 #include <functional>
 #include <iterator>
 #include <sstream>
@@ -258,9 +256,8 @@ struct RNNDescriptors {
             if (!dropout_states) {
                 size_t states_size_in_bytes = 0;
                 MIOPEN_CHECK(miopenDropoutGetStatesSize(handle, &states_size_in_bytes));
-                size_t states_size = states_size_in_bytes / sizeof(rocrand_state_xorwow);
 
-                dropout_states = std::make_unique<DropoutState>(states_size * sizeof(rocrand_state_xorwow));
+                dropout_states = std::make_unique<DropoutState>(states_size_in_bytes);
 
                 dropout_desc.set(handle,
                                  fn.rnn.dropout_rate,

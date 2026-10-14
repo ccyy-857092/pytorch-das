@@ -862,6 +862,41 @@ print(t.is_pinned())
         os.environ["HIPBLASLT_ALLOW_TF32"] = "0"
         torch.backends.cuda.matmul.allow_tf32 = orig
 
+    @unittest.skipIf(not TEST_WITH_ROCM, "not relevant for CUDA testing")
+    def test_hipblaslt_allow_tf32_precision(self):
+        """Verify that HIPBLASLT_ALLOW_TF32 enables actual TF32 computation.
+
+        FP32 preserves the 2**-12 term in each input, while TF32 rounds
+        1.0 + 2**-12 to 1.0. Therefore, this GEMM produces 1024.5 with FP32
+        and 1024.0 with TF32, which distinguishes computation from flag state.
+        """
+        orig_env = os.environ.get("HIPBLASLT_ALLOW_TF32")
+        orig_precision = torch.backends.cuda.matmul.fp32_precision
+        orig_backend = torch.backends.cuda.preferred_blas_library()
+
+        try:
+            torch.backends.cuda.preferred_blas_library("cublaslt")
+            torch.backends.cuda.matmul.allow_tf32 = False
+            os.environ["HIPBLASLT_ALLOW_TF32"] = "1"
+
+            self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+            self.assertEqual(torch.backends.cuda.matmul.fp32_precision, "ieee")
+
+            k = 1024
+            value = 1.0 + 2.0**-12
+            a = torch.full((k, k), value, device="cuda")
+            b = torch.full((k, k), value, device="cuda")
+            result = (a @ b)[0, 0].item()
+
+            self.assertEqual(result, float(k))
+        finally:
+            if orig_env is None:
+                os.environ.pop("HIPBLASLT_ALLOW_TF32", None)
+            else:
+                os.environ["HIPBLASLT_ALLOW_TF32"] = orig_env
+            torch.backends.cuda.matmul.fp32_precision = orig_precision
+            torch.backends.cuda.preferred_blas_library(orig_backend)
+
     def test_float32_matmul_precision_get_set(self):
         orig = torch.get_float32_matmul_precision()
         skip_tf32_cublas = "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE" in os.environ and int(

@@ -839,6 +839,8 @@ class CachingAutotuner(KernelInterface):
                 if v := getattr(cfg, k, None):
                     options[k] = v
         if self.device_props.type == "hip":
+            if compile_meta.get("disable_ftz", False):
+                options["allow_flush_denorm"] = False
             if "waves_per_eu" in compile_meta:
                 options["waves_per_eu"] = compile_meta["waves_per_eu"]
             if "matrix_instr_nonkdim" in compile_meta:

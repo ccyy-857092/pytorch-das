@@ -164,7 +164,7 @@ inline std::string ComputeTypeFor() {
 // ROCBLAS and hipBLASLt.
 template <>
 inline std::string ComputeTypeFor<float>() {
-  if (at::globalContext().float32Precision(at::Float32Backend::CUDA, at::Float32Op::MATMUL) != at::Float32Precision::TF32) {
+  if (!at::globalContext().allowTF32CuBLAS()) {
     return "f32_r";
   } else {
     return "xf32_r";

@@ -4,6 +4,7 @@
 import itertools
 import math
 import operator
+import os
 import random
 import sys
 import warnings
@@ -1132,6 +1133,223 @@ class TestBinaryUfuncs(TestCase):
             self.assertEqual(
                 actual, expect, exact_device=False, exact_dtype=exact_dtype
             )
+
+    def _check_equal(self, a, b, ref, out_cpu, dtype):
+        # Direct comparison: ref (old path / PYTORCH_ROCM_FAST_DIV=0) vs
+        # out_cpu (new path / PYTORCH_ROCM_FAST_DIV=1). No b==0 special case -- both
+        # paths must produce identical outputs for every (a, b) pair.
+        diff = (out_cpu.to(torch.int32) - ref.to(torch.int32)).abs()
+        mismatch = int((diff != 0).sum().item())
+        max_diff = int(diff.max().item()) if diff.numel() else 0
+        total = int(diff.numel())
+
+        # Triage: how many of the mismatches involve b == 0
+        # (helps decide whether the divergence is the rcpf heuristic
+        # mishandling div-by-zero, or a real rounding bug on b != 0).
+        if mismatch > 0:
+            nz_mask = (b != 0).cpu()
+            diff_cpu = diff.cpu()
+            mism_b0 = int(((diff_cpu != 0) & ~nz_mask).sum().item())
+            mism_bnz = int(((diff_cpu != 0) & nz_mask).sum().item())
+            print(
+                f"[div_trunc_int8_fast_check] dtype={dtype} "
+                f"total={total} mismatches={mismatch} max_abs_diff={max_diff} "
+                f"of which b!=0={mism_bnz} b==0={mism_b0}"
+            )
+        else:
+            print(
+                f"[div_trunc_int8_fast_check] dtype={dtype} "
+                f"total={total} mismatches=0 max_abs_diff=0"
+            )
+
+        bad_idx = (diff != 0).nonzero().flatten()[:5].tolist()
+        self.assertEqual(
+            mismatch, 0,
+            f"div_trunc({dtype}) fast path differs from old path on "
+            f"{mismatch}/{total} pairs (max abs diff = {max_diff}); "
+            f"sample mismatches:\n"
+            + "\n".join(
+                f"  i={i} a={int(a[i])} b={int(b[i])} "
+                f"fast={int(out_cpu[i])} old={int(ref[i])}"
+                for i in bad_idx
+            )
+        )
+
+    @onlyCUDA
+    @dtypes(torch.int8, torch.uint8)
+    def test_div_trunc_int8_fast(self, device, dtype):
+        # ROCm-only -- the gfx938 fast path doesn't exist on CUDA builds.
+        if not hasattr(torch, "version") or not getattr(torch.version, "hip", None):
+            self.skipTest("Not an ROCm build (gfx938 fast path absent)")
+        props = torch.cuda.get_device_properties(0)
+        arch = (
+            getattr(props, "gcnArchName", None)
+            or getattr(props, "arch", None)
+            or ""
+        )
+        if "gfx938" not in str(arch).lower():
+            self.skipTest(
+                f"Current arch={arch!r} is not gfx938; "
+                f"set PYTORCH_ROCM_FAST_DIV=1 to test the rcpf path anyway"
+            )
+
+        signed = (dtype is torch.int8)
+
+        # Build the COMPLETE 8-bit value domain. range(-128, 128) gives
+        # all 256 int8 values INCLUDING 127 (which randint(low=...,high=127)
+        # would miss because high is exclusive).
+        if signed:
+            vals = list(range(-128, 128))           # 256 values, -128..127
+        else:
+            vals = list(range(0, 256))              # 256 values, 0..255
+        self.assertEqual(len(vals), 256)
+
+        # Construct the EXHAUSTIVE 256 x 256 grid -- every (a, b) pair.
+        # 256 * 256 = 65,536 unique pairs.
+        a_flat = []
+        b_flat = []
+        for av in vals:
+            a_flat.extend([av] * 256)
+            b_flat.extend(vals)
+
+        # Snap to BLOCK_WORK multiple AND exceed fast-path threshold.
+        # kDivTruncElementsPerBlock = kDivTruncThreads * kDivTruncBytesPerThread
+        #                              = 64 * 64 = 4096
+        # kDivFastPathThreshold = 2 * 1024 * 1024 = 2,097,152
+        BLOCK_WORK = 64 * 64
+        target = 2 * 1024 * 1024
+        repeats = (target + len(a_flat) - 1) // len(a_flat)
+        total = repeats * len(a_flat)
+        # Round DOWN to BLOCK_WORK multiple so the fast path gate accepts it.
+        total -= total % BLOCK_WORK
+        if total < target:
+            repeats += 1
+            total = repeats * len(a_flat)
+            total -= total % BLOCK_WORK
+        repeats = max(1, total // len(a_flat))
+
+        a_flat = (a_flat * repeats)[:total]
+        b_flat = (b_flat * repeats)[:total]
+        self.assertGreaterEqual(total, target,
+                                "fast-path threshold not reached")
+        self.assertEqual(total % BLOCK_WORK, 0,
+                         "size must be multiple of fast-path block work")
+
+        a = torch.tensor(a_flat, dtype=dtype, device=device)
+        b = torch.tensor(b_flat, dtype=dtype, device=device)
+        # For the _check_equal cross-path comparison: include b == 0
+        # cases (the new direct-comparison _check_equal will assert these
+        # agree between old and new paths too).
+        # No need to mask them out -- that's the whole point of the
+        # fast-path-correctness test.
+
+        old_sfu = os.environ.get("PYTORCH_ROCM_FAST_DIV")
+        print(
+            f"[div_trunc_int8_fast] dtype={dtype} arch={arch} "
+            f"PYTORCH_ROCM_FAST_DIV={old_sfu} numel={total} repeats={repeats} "
+            f"unique_pairs={256*256}"
+        )
+        # Path A: old / gpu_kernel (PYTORCH_ROCM_FAST_DIV=0)
+        try:
+            os.environ["PYTORCH_ROCM_FAST_DIV"] = "0"
+            ref = torch.div(a, b, rounding_mode="trunc").cpu()
+
+            # Path B: new / rcpf fast path (PYTORCH_ROCM_FAST_DIV=1)
+            os.environ["PYTORCH_ROCM_FAST_DIV"] = "1"
+            out = torch.div(a, b, rounding_mode="trunc").cpu()
+        finally:
+            if old_sfu is None:
+                os.environ.pop("PYTORCH_ROCM_FAST_DIV", None)
+            else:
+                os.environ["PYTORCH_ROCM_FAST_DIV"] = old_sfu
+
+        # Direct comparison across ALL positions (incl. b == 0).
+        self._check_equal(a, b, ref, out, dtype)
+
+
+    @onlyCUDA
+    @dtypes(torch.bfloat16)
+    def test_div_bf16_fast(self, device, dtype):
+        # ROCm-only -- the packed BF16 conversion path doesn't exist on CUDA.
+        if not hasattr(torch, "version") or not getattr(torch.version, "hip", None):
+            self.skipTest("Not a ROCm build (BF16 packed fast path absent)")
+
+        props = torch.cuda.get_device_properties(0)
+        arch = (
+            getattr(props, "gcnArchName", None)
+            or getattr(props, "arch", None)
+            or ""
+        )
+        if "gfx938" not in str(arch).lower():
+            self.skipTest(
+                f"Current arch={arch!r} is not gfx938; "
+                f"set PYTORCH_ROCM_FAST_DIV=1 to test the packed BF16 path anyway"
+            )
+
+        # kBf16DivMinNumel = 4 * 1024 * 1024.  This shape reaches the
+        # threshold exactly and is divisible by kBf16DivElementsPerBlock
+        # (512 threads * 4 vectors * 8 BF16 values = 16,384 elements).
+        shape = (4096, 1024)
+        numel = math.prod(shape)
+        block_work = 512 * 4 * 8
+        self.assertGreaterEqual(numel, 4 * 1024 * 1024)
+        self.assertEqual(numel % block_work, 0)
+
+        a = make_tensor(
+            shape, device=device, dtype=dtype, low=-100.0, high=100.0
+        )
+        # Keep the denominator finite and away from zero so bitwise
+        # differences identify the BF16 conversion path, not NaN semantics.
+        b = make_tensor(
+            shape, device=device, dtype=dtype, low=0.5, high=10.0
+        )
+
+        print(
+            f"[div_bf16_fast] dtype={dtype} arch={arch} shape={shape} "
+            f"numel={numel} block_work={block_work}"
+        )
+
+        old_sfu = os.environ.get("PYTORCH_ROCM_FAST_DIV")
+        try:
+            # Path A: generic opmath kernel.
+            os.environ["PYTORCH_ROCM_FAST_DIV"] = "0"
+            ref = torch.div(a, b).cpu()
+
+            # Path B: packed v_cvt_pk_bf16_f32 kernel.
+            os.environ["PYTORCH_ROCM_FAST_DIV"] = "1"
+            out = torch.div(a, b).cpu()
+        finally:
+            if old_sfu is None:
+                os.environ.pop("PYTORCH_ROCM_FAST_DIV", None)
+            else:
+                os.environ["PYTORCH_ROCM_FAST_DIV"] = old_sfu
+
+        ref_flat = ref.flatten()
+        out_flat = out.flatten()
+        mismatch_mask = ref_flat.view(torch.int16) != out_flat.view(torch.int16)
+        mismatch = int(mismatch_mask.sum().item())
+        max_abs_diff = float((out_flat.float() - ref_flat.float()).abs().max())
+        print(
+            f"[div_bf16_fast_check] total={numel} mismatches={mismatch} "
+            f"max_abs_diff={max_abs_diff}"
+        )
+
+        bad_idx = mismatch_mask.nonzero().flatten()[:5].tolist()
+        a_flat = a.flatten()
+        b_flat = b.flatten()
+        self.assertEqual(
+            mismatch,
+            0,
+            f"BF16 packed fast path differs from generic path on "
+            f"{mismatch}/{numel} elements (max abs diff = {max_abs_diff}); "
+            f"sample mismatches:\n"
+            + "\n".join(
+                f"  i={i} a={float(a_flat[i])} b={float(b_flat[i])} "
+                f"fast={float(out_flat[i])} old={float(ref_flat[i])}"
+                for i in bad_idx
+            ),
+        )
+
 
     @dtypes(*complex_types())
     def test_complex_div_underflow_overflow(self, device, dtype):

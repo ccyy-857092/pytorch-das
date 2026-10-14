@@ -336,9 +336,6 @@ class AsyncCheckpointer(Checkpointer):
         This method should be called when the checkpointer is no longer needed to ensure
         proper cleanup of async resources.
         """
-        if self._write_future is not None:
-            self._write_future.result()
-
         self._checkpoint_stager.close()
         self._checkpoint_process.close()
         logger.info("AsyncCheckpointer closed")
