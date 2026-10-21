@@ -2,39 +2,126 @@ name: PyTorch CI
 run-name: "PyTorch - ${{ github.event_name }} - ${{ github.event.pull_request.number || github.ref_name || 'nightly' }}"
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - 2.12.0-dev
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches:
       - 2.12.0-dev
   workflow_dispatch:
   schedule:
-    # GitHub cron is UTC: Beijing 00:00 every Monday and Thursday.
+    # GitHub cron is UTC: Beijing 00:00 every Saturday.
     # The reusable workflow skips the full test when the branch has had no
     # commits during the previous seven days.
-    - cron: "0 16 * * 0,3"
+    - cron: "0 16 * * 5"
 
 permissions:
   contents: read
 
 concurrency:
   group: pytorch-${{ github.event.pull_request.number || github.ref_name || github.event_name }}
-  cancel-in-progress: false
+  cancel-in-progress: >-
+    ${{
+      github.event_name == 'pull_request_target' &&
+      (github.event.action != 'labeled' ||
+       github.event.label.name == 'ready-hcu')
+    }}
 
 jobs:
+  authorize-pr:
+    name: authorize HCU execution
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      authorized: ${{ steps.authorization.outputs.authorized }}
+    steps:
+      - name: Verify ready-hcu authorization
+        id: authorization
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "ready-hcu";
+            const action = context.payload.action;
+            const pullRequest = context.payload.pull_request;
+            const labels = pullRequest.labels.map(item => item.name);
+            const resetActions = new Set([
+              "opened",
+              "synchronize",
+              "reopened",
+              "ready_for_review",
+            ]);
+
+            core.setOutput("authorized", "false");
+
+            if (resetActions.has(action)) {
+              if (labels.includes(label)) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pullRequest.number,
+                    name: label,
+                  });
+                } catch (error) {
+                  if (error.status !== 404) {
+                    throw error;
+                  }
+                }
+              }
+              core.setFailed(
+                `HCU CI is locked for ${pullRequest.head.sha}. ` +
+                `A trusted maintainer must apply the ${label} label.`
+              );
+              return;
+            }
+
+            if (action === "labeled" && context.payload.label?.name !== label) {
+              core.info(`Ignoring unrelated label: ${context.payload.label?.name}.`);
+              return;
+            }
+
+            if (action !== "labeled") {
+              core.setFailed(`Unsupported pull request action: ${action}.`);
+              return;
+            }
+
+            const response = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            const permission = response.data.permission;
+            const trusted = new Set(["write", "maintain", "admin"]);
+            if (!trusted.has(permission)) {
+              core.setFailed(
+                `${context.actor} cannot authorize HCU CI (permission: ${permission}).`
+              );
+              return;
+            }
+
+            core.info(
+              `${context.actor} authorized HCU CI for ${pullRequest.head.sha}.`
+            );
+            core.setOutput("authorized", "true");
+
   pipeline:
     name: build, test and optional publish
+    needs: authorize-pr
     if: >-
       ${{
-        github.event_name != 'pull_request' ||
-        github.event.pull_request.head.repo.full_name == github.repository
+        always() &&
+        (github.event_name != 'pull_request_target' ||
+         (needs.authorize-pr.result == 'success' &&
+          needs.authorize-pr.outputs.authorized == 'true'))
       }}
     uses: ./.github/workflows/_pytorch-pipeline.yml
     with:
       suite: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'full' || 'pr' }}
-      source_ref: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2.12.0-dev' || (github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha) }}
+      source_ref: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2.12.0-dev' || (github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha) }}
       # DTK 26.10 is temporarily disabled; run the pipeline with DTK 26.04 only.
       dtk_variants: >-
         [
@@ -44,9 +131,9 @@ jobs:
             "package": "DTK-26.04-rc4-centos8-x86_64.tar.gz"
           }
         ]
-      merge_pr: ${{ github.event_name == 'pull_request' }}
-      pr_base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-      pr_head_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+      merge_pr: ${{ github.event_name == 'pull_request_target' }}
+      pr_base_sha: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || '' }}
+      pr_head_sha: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' }}
       publish: ${{ github.event_name == 'push' && github.ref_name == '2.12.0-dev' }}
     secrets:
-      PYPI_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+      PYPI_PASSWORD: ${{ github.event_name == 'push' && secrets.PYPI_PASSWORD || '' }}

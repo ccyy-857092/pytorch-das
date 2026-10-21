@@ -128,6 +128,8 @@ echo ">>>>>>>>>>LOAD INSTALLED DTK<<<<<<<<<<"
 set +u
 source "${DTK_ROOT}/env.sh"
 set -u
+: "${AMDGPU_TARGETS:?ERROR: DTK env.sh did not set AMDGPU_TARGETS}"
+export AMDGPU_TARGETS
 
 ### 根据容器中已安装的 DTK 版本自动选择 MAGMA；显式 MAGMA_URL 优先。
 DTK_BUILD_VERSION="$(tr -d '.[:space:]' < "${DTK_ROOT}/.info/rocm_version" 2>/dev/null || true)"
@@ -342,6 +344,7 @@ else
     MAGMA_OPT=OFF
 fi
 ROCM_PATH=${ROCM_PATH} \
+PYTORCH_ROCM_ARCH="${AMDGPU_TARGETS}" \
 USE_AOTRITON_FA=0 \
 USE_MEM_EFF_ATTENTION=0 \
 USE_FLASH_ATTENTION=1 \

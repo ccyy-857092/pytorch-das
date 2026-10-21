@@ -120,8 +120,8 @@
 	url = https://github.com/NVIDIA/NVTX.git
 [submodule "third_party/composable_kernel"]
 	path = third_party/composable_kernel
-	url = https://github.com/ROCm/composable_kernel.git
-	branch = develop
+	url = https://github.com/HYGON-AI/composable_kernel-das.git
+    branch = main
 [submodule "third_party/kleidiai"]
 	path = third_party/kleidiai
 	url = https://github.com/ARM-software/kleidiai.git

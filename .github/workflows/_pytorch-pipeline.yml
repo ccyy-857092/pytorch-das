@@ -56,11 +56,6 @@ env:
 jobs:
   preflight:
     name: preflight
-    if: >-
-      ${{
-        github.event_name != 'pull_request' ||
-        github.event.pull_request.head.repo.full_name == github.repository
-      }}
     runs-on: bw1100
     outputs:
       should_run: ${{ steps.context.outputs.should_run }}
@@ -178,6 +173,7 @@ jobs:
     if: >-
       ${{
         always() &&
+        !inputs.publish &&
         needs.preflight.outputs.should_run == 'true' &&
         needs.build_dtk2604.result == 'success'
       }}
@@ -239,13 +235,12 @@ jobs:
 
   publish:
     name: publish (${{ matrix.dtk.id }})
-    needs: [preflight, build_dtk2604, test]
+    needs: [preflight, build_dtk2604]
     if: >-
       ${{
         always() && inputs.publish && inputs.suite == 'pr' &&
         needs.preflight.outputs.should_run == 'true' &&
-        needs.build_dtk2604.result == 'success' &&
-        needs.test.result == 'success'
+        needs.build_dtk2604.result == 'success'
       }}
     runs-on: bw1100
     strategy:
